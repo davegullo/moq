@@ -10,10 +10,36 @@ struct Session {
 	// The collection of published broadcasts.
 	origin: moq_lite::OriginProducer,
 
+	// The URL this session is connected to.
+	url: Url,
+
 	// A simple signal to notify the background task when closed.
 	#[allow(dead_code)]
 	closed: oneshot::Sender<()>,
 }
+
+struct Subscription {
+	// The origin consumer for this subscription.
+	origin: moq_lite::OriginConsumer,
+
+	// A simple signal to notify the background task when closed.
+	#[allow(dead_code)]
+	closed: oneshot::Sender<()>,
+
+	// Callbacks for handling catalog and frame data.
+	callbacks: SubscriptionCallbacks,
+}
+
+#[derive(Clone)]
+pub struct SubscriptionCallbacks {
+	pub user_data: *mut std::ffi::c_void,
+	pub on_catalog: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, catalog_json: *const std::ffi::c_char)>,
+	pub on_video: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, track: i32, data: *const u8, size: usize, pts: u64, keyframe: bool)>,
+	pub on_audio: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, track: i32, data: *const u8, size: usize, pts: u64)>,
+	pub on_error: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, code: i32)>,
+}
+
+unsafe impl Send for SubscriptionCallbacks {}
 
 pub struct State {
 	// All sessions by ID.
@@ -24,6 +50,9 @@ pub struct State {
 
 	// All tracks, indexed by an ID.
 	tracks: NonZeroSlab<hang::import::Decoder>,
+
+	// All subscriptions by ID.
+	subscriptions: NonZeroSlab<Subscription>,
 }
 
 pub struct StateGuard {
@@ -80,6 +109,7 @@ impl State {
 			sessions: Default::default(),
 			broadcasts: Default::default(),
 			tracks: Default::default(),
+			subscriptions: Default::default(),
 		}
 	}
 
@@ -92,6 +122,7 @@ impl State {
 		let id = self.sessions.insert(Session {
 			closed: closed.0,
 			origin: origin.producer,
+			url: url.clone(),
 		});
 
 		tokio::spawn(async move {
@@ -150,14 +181,13 @@ impl State {
 		Ok(())
 	}
 
-	pub fn create_track(&mut self, broadcast: Id, format: &str, init: &[u8]) -> Result<Id, Error> {
+	pub fn create_track(&mut self, broadcast: Id, format: &str, mut init: &[u8]) -> Result<Id, Error> {
 		let broadcast = self.broadcasts.get_mut(broadcast).ok_or(Error::NotFound)?;
 		let mut decoder = hang::import::Decoder::new(broadcast.clone(), format)
 			.ok_or_else(|| Error::UnknownFormat(format.to_string()))?;
 
-		let mut temp = init;
 		decoder
-			.initialize(&mut temp)
+			.initialize(&mut init)
 			.map_err(|err| Error::InitFailed(Arc::new(err)))?;
 		assert!(init.is_empty(), "buffer was not fully consumed");
 
@@ -179,6 +209,164 @@ impl State {
 
 	pub fn remove_track(&mut self, track: Id) -> Result<(), Error> {
 		self.tracks.remove(track).ok_or(Error::NotFound)?;
+		Ok(())
+	}
+
+	pub fn subscribe_from_session(&mut self, session_id: Id, path: String, callbacks: SubscriptionCallbacks) -> Result<Id, Error> {
+		let session = self.sessions.get_mut(session_id).ok_or(Error::NotFound)?;
+
+		// For now, we'll create a new connection for subscribing since the existing session is used for publishing
+		// TODO: Support subscribing on the same session when moq_lite supports it
+		let url = session.url.clone();
+
+		// Used just to notify when the subscription is removed from the map.
+		let closed = oneshot::channel();
+
+		let id = self.subscriptions.insert(Subscription {
+			closed: closed.0,
+			origin: moq_lite::Origin::produce().consumer,
+			callbacks: callbacks.clone(),
+		});
+
+		let _on_error = callbacks.on_error;
+		let _user_data = callbacks.user_data;
+
+		// For now, we'll handle errors by logging them since calling callbacks
+		// from tokio threads with raw pointers is complex in Rust.
+		// TODO: Implement a proper callback mechanism that works with tokio
+		tokio::spawn(async move {
+			let result = tokio::select! {
+				// No more receiver, which means [subscription_close] was called.
+				_ = closed.1 => Ok(()),
+				// The connection failed.
+				res = Self::subscribe_run(url, path, callbacks) => res,
+			};
+
+			if let Err(err) = result {
+				tracing::error!("Subscription error: {}", err);
+				// TODO: Send error to main thread for callback
+			}
+		});
+
+		Ok(id)
+	}
+
+	async fn subscribe_run(
+		url: Url,
+		path: String,
+		callbacks: SubscriptionCallbacks,
+	) -> Result<(), Error> {
+		let config = moq_native::ClientConfig::default();
+		let client = config.init().map_err(|err| Error::Connect(Arc::new(err)))?;
+		let connection = client.connect(url).await.map_err(|err| Error::Connect(Arc::new(err)))?;
+		let origin = moq_lite::Origin::produce();
+		let session = moq_lite::Session::connect(connection, None, Some(origin.producer)).await?;
+
+		tracing::info!(broadcast = %path, "waiting for broadcast to be online");
+
+		let path: moq_lite::Path<'_> = path.into();
+		let mut origin = origin
+			.consumer
+			.consume_only(&[path])
+			.ok_or(Error::NotFound)?;
+
+		// Track the current video and audio subscribers
+		let mut video_subscribers: std::collections::HashMap<String, hang::TrackConsumer> = std::collections::HashMap::new();
+		let mut audio_subscribers: std::collections::HashMap<String, hang::TrackConsumer> = std::collections::HashMap::new();
+
+		loop {
+			tokio::select! {
+				Some(announce) = origin.announced() => match announce {
+					(path, Some(broadcast)) => {
+						tracing::info!(broadcast = %path, "broadcast is online, subscribing to catalog");
+
+						// Subscribe to catalog track
+						let catalog_track = broadcast.subscribe_track(&moq_lite::Track {
+							name: hang::catalog::Catalog::DEFAULT_NAME.to_string(),
+							priority: 100,
+						});
+
+						let mut catalog = hang::catalog::CatalogConsumer::new(catalog_track);
+
+						// Wait for initial catalog
+						if let Some(catalog_data) = catalog.next().await? {
+							let catalog_json = catalog_data.to_string()?;
+							if let Some(on_catalog) = callbacks.on_catalog {
+								let c_string = std::ffi::CString::new(catalog_json).unwrap();
+								unsafe { on_catalog(callbacks.user_data, c_string.as_ptr()) };
+							}
+
+							// Subscribe to video tracks
+							if let Some(video) = &catalog_data.video {
+								for (track_name, _config) in &video.renditions {
+									let track = broadcast.subscribe_track(&moq_lite::Track {
+										name: track_name.clone(),
+										priority: video.priority,
+									});
+									video_subscribers.insert(track_name.clone(), hang::TrackConsumer::new(track));
+								}
+							}
+
+							// Subscribe to audio tracks
+							if let Some(audio) = &catalog_data.audio {
+								for (track_name, _config) in &audio.renditions {
+									let track = broadcast.subscribe_track(&moq_lite::Track {
+										name: track_name.clone(),
+										priority: audio.priority,
+									});
+									audio_subscribers.insert(track_name.clone(), hang::TrackConsumer::new(track));
+								}
+							}
+						}
+					}
+					(path, None) => {
+						tracing::warn!(broadcast = %path, "broadcast is offline, waiting...");
+						video_subscribers.clear();
+						audio_subscribers.clear();
+					}
+				},
+				res = session.closed() => return res.map_err(Into::into),
+				// Handle video frames
+				Some((_track_name, frame)) = Self::next_video_frame(&mut video_subscribers) => {
+					if let Some(on_video) = callbacks.on_video {
+						let pts = frame.timestamp.as_micros();
+						let keyframe = frame.keyframe;
+						unsafe { on_video(callbacks.user_data, 0, frame.payload.as_ptr(), frame.payload.len(), pts, keyframe) };
+					}
+				},
+				// Handle audio frames
+				Some((_track_name, frame)) = Self::next_audio_frame(&mut audio_subscribers) => {
+					if let Some(on_audio) = callbacks.on_audio {
+						let pts = frame.timestamp.as_micros();
+						unsafe { on_audio(callbacks.user_data, 0, frame.payload.as_ptr(), frame.payload.len(), pts) };
+					}
+				},
+			}
+		}
+	}
+
+	async fn next_video_frame(subscribers: &mut std::collections::HashMap<String, hang::TrackConsumer>) -> Option<(String, hang::Frame)> {
+		// This is a simplified version - in practice you'd need to handle multiple subscribers
+		for (name, subscriber) in subscribers.iter_mut() {
+			if let Ok(Some(frame)) = subscriber.read_frame().await {
+				return Some((name.clone(), frame));
+			}
+		}
+		None
+	}
+
+	async fn next_audio_frame(subscribers: &mut std::collections::HashMap<String, hang::TrackConsumer>) -> Option<(String, hang::Frame)> {
+		// This is a simplified version - in practice you'd need to handle multiple subscribers
+		for (name, subscriber) in subscribers.iter_mut() {
+			if let Ok(Some(frame)) = subscriber.read_frame().await {
+				return Some((name.clone(), frame));
+			}
+		}
+		None
+	}
+
+	pub fn unsubscribe(&mut self, id: Id) -> Result<(), Error> {
+		self.subscriptions.remove(id).ok_or(Error::NotFound)?;
 		Ok(())
 	}
 }

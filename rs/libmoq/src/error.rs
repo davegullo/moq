@@ -42,6 +42,9 @@ pub enum Error {
 	#[error("timestamp overflow")]
 	TimestampOverflow(#[from] hang::TimestampOverflow),
 
+	#[error("hang error: {0}")]
+	Hang(#[from] hang::Error),
+
 	#[error("level error: {0}")]
 	Level(Arc<tracing::metadata::ParseLevelError>),
 
@@ -74,7 +77,8 @@ impl ffi::ReturnCode for Error {
 			Error::InitFailed(_) => -10,
 			Error::DecodeFailed(_) => -11,
 			Error::TimestampOverflow(_) => -13,
-			Error::Level(_) => -14,
+			Error::Hang(_) => -14,
+			Error::Level(_) => -15,
 			Error::InvalidCode => -15,
 			Error::Panic => -16,
 		}

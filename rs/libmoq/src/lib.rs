@@ -165,3 +165,47 @@ pub unsafe extern "C" fn moq_track_write(id: i32, data: *const u8, data_size: us
 		State::lock().write_track(id, data, pts)
 	})
 }
+
+/// Subscribe to a broadcast at the given session/path.
+///
+/// Returns a non-zero handle to the subscription on success, or a negative code on failure.
+/// You should call [moq_subscribe_close], even on error, to free up resources.
+///
+/// # Safety
+/// - The caller must ensure that path is a valid null-terminated C string.
+/// - The caller must ensure that callback functions are valid, or null.
+/// - The caller must ensure that user_data is a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn moq_subscribe_create(
+	session: i32,
+	path: *const std::ffi::c_char,
+	on_catalog: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, catalog_json: *const std::ffi::c_char)>,
+	on_video: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, track: i32, data: *const u8, size: usize, pts: u64, keyframe: bool)>,
+	on_audio: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, track: i32, data: *const u8, size: usize, pts: u64)>,
+	on_error: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, code: i32)>,
+	user_data: *mut std::ffi::c_void,
+) -> i32 {
+	ffi::return_code(move || {
+		let session = ffi::parse_id(session)?;
+		let path = unsafe { ffi::parse_str(path) }?;
+		let callbacks = crate::state::SubscriptionCallbacks {
+			user_data,
+			on_catalog,
+			on_video,
+			on_audio,
+			on_error,
+		};
+		State::lock().subscribe_from_session(session, path.to_string(), callbacks)
+	})
+}
+
+/// Close a subscription.
+///
+/// Returns a zero on success, or a negative code on failure.
+#[no_mangle]
+pub extern "C" fn moq_subscribe_close(id: i32) -> i32 {
+	ffi::return_code(move || {
+		let id = ffi::parse_id(id)?;
+		State::lock().unsubscribe(id)
+	})
+}
