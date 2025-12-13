@@ -1,6 +1,7 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+use moq_lite::coding::Buf;
 use tokio::sync::oneshot;
 use url::Url;
 
@@ -331,14 +332,44 @@ impl State {
 					if let Some(on_video) = callbacks.on_video {
 						let pts = frame.timestamp.as_micros();
 						let keyframe = frame.keyframe;
-						unsafe { on_video(callbacks.user_data, 0, frame.payload.as_ptr(), frame.payload.len(), pts, keyframe) };
+						// Collect BufList chunks into a contiguous buffer for FFI
+						let data: Vec<u8> = frame.payload.chunk().to_vec();
+						let remaining = frame.payload.remaining();
+						if data.len() < remaining {
+							// Multiple chunks - need to collect all
+							let mut full_data = Vec::with_capacity(remaining);
+							let mut payload = frame.payload;
+							while payload.has_remaining() {
+								full_data.extend_from_slice(payload.chunk());
+								let len = payload.chunk().len();
+								payload.advance(len);
+							}
+							unsafe { on_video(callbacks.user_data, 0, full_data.as_ptr(), full_data.len(), pts, keyframe) };
+						} else {
+							unsafe { on_video(callbacks.user_data, 0, data.as_ptr(), data.len(), pts, keyframe) };
+						}
 					}
 				},
 				// Handle audio frames
 				Some((_track_name, frame)) = Self::next_audio_frame(&mut audio_subscribers) => {
 					if let Some(on_audio) = callbacks.on_audio {
 						let pts = frame.timestamp.as_micros();
-						unsafe { on_audio(callbacks.user_data, 0, frame.payload.as_ptr(), frame.payload.len(), pts) };
+						// Collect BufList chunks into a contiguous buffer for FFI
+						let data: Vec<u8> = frame.payload.chunk().to_vec();
+						let remaining = frame.payload.remaining();
+						if data.len() < remaining {
+							// Multiple chunks - need to collect all
+							let mut full_data = Vec::with_capacity(remaining);
+							let mut payload = frame.payload;
+							while payload.has_remaining() {
+								full_data.extend_from_slice(payload.chunk());
+								let len = payload.chunk().len();
+								payload.advance(len);
+							}
+							unsafe { on_audio(callbacks.user_data, 0, full_data.as_ptr(), full_data.len(), pts) };
+						} else {
+							unsafe { on_audio(callbacks.user_data, 0, data.as_ptr(), data.len(), pts) };
+						}
 					}
 				},
 			}
