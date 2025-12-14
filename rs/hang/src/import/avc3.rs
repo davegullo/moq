@@ -59,7 +59,7 @@ impl Avc3 {
 		let mut i = 0;
 		while i < data.len() {
 			// Look for NALU start code
-			if i + 3 < data.len() && data[i..i+4] == [0, 0, 0, 1] {
+			if i + 3 < data.len() && data[i..i + 4] == [0, 0, 0, 1] {
 				let nal_start = i + 4;
 
 				// Find the next start code or end of data
@@ -74,10 +74,12 @@ impl Avc3 {
 					let nal_data = &data[nal_start..nal_end];
 
 					match nal_type {
-						7 => { // SPS
+						7 => {
+							// SPS
 							sps_data = Some(nal_data.to_vec());
 						}
-						8 => { // PPS
+						8 => {
+							// PPS
 							pps_data = Some(nal_data.to_vec());
 						}
 						_ => {}
@@ -103,18 +105,17 @@ impl Avc3 {
 		let level_idc = sps[3];
 
 		// Build AVCC format
-		let mut avcc = Vec::new();
-
-		// AVCC header
-		avcc.push(1); // version
-		avcc.push(profile_idc); // profile
-		avcc.push(constraint_flags); // profile compatibility
-		avcc.push(level_idc); // level
-		avcc.push(0xFC | 3); // NALU length size minus 1 (3 = 4 bytes)
+		let mut avcc = vec![
+			1,                // version
+			profile_idc,      // profile
+			constraint_flags, // profile compatibility
+			level_idc,        // level
+			0xFC | 3,         // NALU length size minus 1 (3 = 4 bytes)
+		];
 
 		// SPS count
 		avcc.push(1); // number of SPS
-		// SPS size (big endian)
+				// SPS size (big endian)
 		let sps_size = (sps.len() as u16).to_be_bytes();
 		avcc.extend_from_slice(&sps_size);
 		// SPS data
@@ -122,7 +123,7 @@ impl Avc3 {
 
 		// PPS count
 		avcc.push(1); // number of PPS
-		// PPS size (big endian)
+				// PPS size (big endian)
 		let pps_size = (pps.len() as u16).to_be_bytes();
 		avcc.extend_from_slice(&pps_size);
 		// PPS data

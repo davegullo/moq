@@ -7,7 +7,8 @@ use super::{Avc3, Fmp4};
 #[derive(derive_more::From)]
 enum DecoderKind {
 	/// aka H264 with inline SPS/PPS
-	Avc3(Avc3),
+	// Boxed because it's a large struct and clippy complains about the size.
+	Avc3(Box<Avc3>),
 	// Boxed because it's a large struct and clippy complains about the size.
 	Fmp4(Box<Fmp4>),
 	Aac(Aac),
@@ -28,15 +29,15 @@ impl Decoder {
 	/// Create a new decoder with the given format, or `None` if the format is not supported.
 	pub fn new(broadcast: hang::BroadcastProducer, format: &str) -> Option<Self> {
 		let decoder = match format {
-			"avc3" => Avc3::new(broadcast).into(),
+			"avc3" => Box::new(Avc3::new(broadcast)).into(),
 			"h264" => {
 				// NOTE: avc1 is unsupported, because the SPS/PPS are out-of-band.
 				tracing::warn!("'h264' format is deprecated, use 'avc3' instead");
-				Avc3::new(broadcast).into()
+				Box::new(Avc3::new(broadcast)).into()
 			}
 			"annex-b" => {
 				tracing::warn!("'annex-b' format is deprecated, use 'avc3' instead");
-				Avc3::new(broadcast).into()
+				Box::new(Avc3::new(broadcast)).into()
 			}
 			"fmp4" | "cmaf" => Box::new(Fmp4::new(broadcast)).into(),
 			"aac" => Aac::new(broadcast).into(),
