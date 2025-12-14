@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -46,11 +47,6 @@ pub struct SubscriptionCallbacks {
 	pub on_error: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, code: i32)>,
 }
 
-// SAFETY: SubscriptionCallbacks will be moved into tokio tasks and called across thread boundaries.
-// The C/FFI side MUST guarantee:
-// - user_data points to thread-safe data or is only accessed from a single thread
-// - Function pointers remain valid for the subscription's lifetime
-// - Proper synchronization of any user_data access
 unsafe impl Send for SubscriptionCallbacks {}
 
 pub struct State {
@@ -114,6 +110,9 @@ static RUNTIME: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
 });
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::new()));
+
+// Global mapping from track names to stable numeric IDs for multi-track identification
+static TRACK_NAME_TO_ID: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl State {
 	fn new() -> Self {
@@ -224,6 +223,19 @@ impl State {
 		Ok(())
 	}
 
+	// Get or create a stable numeric ID for a track name
+	fn get_or_create_track_id(track_name: &str) -> u32 {
+		let mut map = TRACK_NAME_TO_ID.lock().unwrap();
+		if let Some(&id) = map.get(track_name) {
+			id
+		} else {
+			// Find the next available ID (starting from 0)
+			let next_id = map.len() as u32;
+			map.insert(track_name.to_string(), next_id);
+			next_id
+		}
+	}
+
 	pub fn subscribe_from_session(
 		&mut self,
 		session_id: Id,
@@ -300,11 +312,8 @@ impl State {
 						if let Some(catalog_data) = catalog.next().await? {
 							let catalog_json = catalog_data.to_string()?;
 							if let Some(on_catalog) = callbacks.on_catalog {
-								if let Ok(c_string) = std::ffi::CString::new(catalog_json) {
-									unsafe { on_catalog(callbacks.user_data, c_string.as_ptr()) };
-								} else {
-									tracing::warn!("Catalog JSON contains null bytes, skipping callback");
-								}
+								let c_string = std::ffi::CString::new(catalog_json).unwrap();
+								unsafe { on_catalog(callbacks.user_data, c_string.as_ptr()) };
 							}
 
 							// Subscribe to video tracks
@@ -338,8 +347,9 @@ impl State {
 				},
 				res = session.closed() => return res.map_err(Into::into),
 				// Handle video frames
-				Some((_track_name, frame)) = Self::next_video_frame(&mut video_subscribers) => {
+				Some((track_name, frame)) = Self::next_video_frame(&mut video_subscribers) => {
 					if let Some(on_video) = callbacks.on_video {
+						let track_id = Self::get_or_create_track_id(&track_name);
 						let pts = frame.timestamp.as_micros();
 						let keyframe = frame.keyframe;
 						// Collect BufList chunks into a contiguous buffer for FFI
@@ -354,15 +364,16 @@ impl State {
 								let len = payload.chunk().len();
 								payload.advance(len);
 							}
-							unsafe { on_video(callbacks.user_data, 0, full_data.as_ptr(), full_data.len(), pts, keyframe) };
+							unsafe { on_video(callbacks.user_data, track_id as i32, full_data.as_ptr(), full_data.len(), pts, keyframe) };
 						} else {
-							unsafe { on_video(callbacks.user_data, 0, data.as_ptr(), data.len(), pts, keyframe) };
+							unsafe { on_video(callbacks.user_data, track_id as i32, data.as_ptr(), data.len(), pts, keyframe) };
 						}
 					}
 				},
 				// Handle audio frames
-				Some((_track_name, frame)) = Self::next_audio_frame(&mut audio_subscribers) => {
+				Some((track_name, frame)) = Self::next_audio_frame(&mut audio_subscribers) => {
 					if let Some(on_audio) = callbacks.on_audio {
+						let track_id = Self::get_or_create_track_id(&track_name);
 						let pts = frame.timestamp.as_micros();
 						// Collect BufList chunks into a contiguous buffer for FFI
 						let data: Vec<u8> = frame.payload.chunk().to_vec();
@@ -376,9 +387,9 @@ impl State {
 								let len = payload.chunk().len();
 								payload.advance(len);
 							}
-							unsafe { on_audio(callbacks.user_data, 0, full_data.as_ptr(), full_data.len(), pts) };
+							unsafe { on_audio(callbacks.user_data, track_id as i32, full_data.as_ptr(), full_data.len(), pts) };
 						} else {
-							unsafe { on_audio(callbacks.user_data, 0, data.as_ptr(), data.len(), pts) };
+							unsafe { on_audio(callbacks.user_data, track_id as i32, data.as_ptr(), data.len(), pts) };
 						}
 					}
 				},
