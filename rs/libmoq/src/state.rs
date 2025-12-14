@@ -46,7 +46,6 @@ pub struct SubscriptionCallbacks {
 	pub on_audio: Option<
 		unsafe extern "C" fn(user_data: *mut std::ffi::c_void, track: i32, data: *const u8, size: usize, pts: u64),
 	>,
-	#[allow(dead_code)] // TODO: Implement safe error callback mechanism for tokio threads
 	pub on_error: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, code: i32)>, // Called when subscription fails
 }
 
