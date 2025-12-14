@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use moq_lite::coding::Buf;
 use tokio::sync::oneshot;
 use url::Url;
@@ -294,6 +296,10 @@ impl State {
 			std::collections::HashMap::new();
 
 		loop {
+			// Create futures for polling frames from all subscribers fairly
+			let video_frame_future = Self::poll_next_frame(&mut video_subscribers);
+			let audio_frame_future = Self::poll_next_frame(&mut audio_subscribers);
+
 			tokio::select! {
 				Some(announce) = origin.announced() => match announce {
 					(path, Some(broadcast)) => {
@@ -345,8 +351,8 @@ impl State {
 					}
 				},
 				res = session.closed() => return res.map_err(Into::into),
-				// Handle video frames
-				Some((track_name, frame)) = Self::next_video_frame(&mut video_subscribers) => {
+				// Handle video frames with fair polling
+				Some((track_name, frame)) = video_frame_future => {
 					if let Some(on_video) = callbacks.on_video {
 						let track_id = Self::get_or_create_track_id(&track_name);
 						let pts = frame.timestamp.as_micros();
@@ -369,8 +375,8 @@ impl State {
 						}
 					}
 				},
-				// Handle audio frames
-				Some((track_name, frame)) = Self::next_audio_frame(&mut audio_subscribers) => {
+				// Handle audio frames with fair polling
+				Some((track_name, frame)) = audio_frame_future => {
 					if let Some(on_audio) = callbacks.on_audio {
 						let track_id = Self::get_or_create_track_id(&track_name);
 						let pts = frame.timestamp.as_micros();
@@ -396,28 +402,19 @@ impl State {
 		}
 	}
 
-	async fn next_video_frame(
+	async fn poll_next_frame(
 		subscribers: &mut std::collections::HashMap<String, hang::TrackConsumer>,
 	) -> Option<(String, hang::Frame)> {
-		// This is a simplified version - in practice you'd need to handle multiple subscribers
-		for (name, subscriber) in subscribers.iter_mut() {
-			if let Ok(Some(frame)) = subscriber.read_frame().await {
-				return Some((name.clone(), frame));
-			}
-		}
-		None
-	}
+		// Use FuturesUnordered to fairly poll all subscribers
+		let mut futures = FuturesUnordered::new();
 
-	async fn next_audio_frame(
-		subscribers: &mut std::collections::HashMap<String, hang::TrackConsumer>,
-	) -> Option<(String, hang::Frame)> {
-		// This is a simplified version - in practice you'd need to handle multiple subscribers
 		for (name, subscriber) in subscribers.iter_mut() {
-			if let Ok(Some(frame)) = subscriber.read_frame().await {
-				return Some((name.clone(), frame));
-			}
+			let name = name.clone();
+			futures.push(async move { subscriber.read_frame().await.ok().flatten().map(|frame| (name, frame)) });
 		}
-		None
+
+		// Wait for the first available frame from any subscriber
+		futures.next().await.flatten()
 	}
 
 	pub fn unsubscribe(&mut self, id: Id) -> Result<(), Error> {
