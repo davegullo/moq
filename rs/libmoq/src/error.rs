@@ -79,8 +79,8 @@ impl ffi::ReturnCode for Error {
 			Error::TimestampOverflow(_) => -13,
 			Error::Hang(_) => -14,
 			Error::Level(_) => -15,
-			Error::InvalidCode => -15,
-			Error::Panic => -16,
+			Error::InvalidCode => -16,
+			Error::Panic => -17,
 		}
 	}
 }
