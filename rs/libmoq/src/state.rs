@@ -49,7 +49,6 @@ pub struct SubscriptionCallbacks {
 	pub on_error: Option<unsafe extern "C" fn(user_data: *mut std::ffi::c_void, code: i32)>,
 }
 
-
 unsafe impl Send for SubscriptionCallbacks {}
 
 pub struct State {
