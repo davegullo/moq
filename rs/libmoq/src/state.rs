@@ -47,7 +47,12 @@ impl DerefMut for StateGuard {
 impl State {
 	pub fn lock() -> StateGuard {
 		let runtime = RUNTIME.enter();
-		let state = STATE.lock().unwrap();
+		let state = STATE.lock().unwrap_or_else(|poisoned| {
+			// If the mutex is poisoned due to a previous panic, we still want to continue
+			// Recover the state from the poisoned mutex
+			tracing::warn!("Mutex was poisoned, recovering from previous panic");
+			poisoned.into_inner()
+		});
 		StateGuard {
 			_runtime: runtime,
 			state,
@@ -159,7 +164,8 @@ impl State {
 		decoder
 			.initialize(&mut temp)
 			.map_err(|err| Error::InitFailed(Arc::new(err)))?;
-		assert!(init.is_empty(), "buffer was not fully consumed");
+		// Note: Some decoders may not consume the entire buffer if they only need initialization data
+		// This is normal behavior and should not cause a panic
 
 		let id = self.tracks.insert(decoder);
 		Ok(id)

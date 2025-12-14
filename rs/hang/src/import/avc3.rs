@@ -23,6 +23,9 @@ pub struct Avc3 {
 
 	// The current frame being built.
 	current: Frame,
+
+	// The initialization data (SPS/PPS) for the catalog description.
+	description: Option<bytes::Bytes>,
 }
 
 impl Avc3 {
@@ -32,7 +35,100 @@ impl Avc3 {
 			track: None,
 			config: None,
 			current: Default::default(),
+			description: None,
 		}
+	}
+
+	pub fn initialize<T: bytes::Buf>(&mut self, buf: &mut T) -> anyhow::Result<()> {
+		// Store the initialization data for the catalog description
+		let data = buf.copy_to_bytes(buf.remaining());
+
+		// Convert raw SPS/PPS to AVCC format for WebCodecs compatibility
+		let avcc_data = Self::sps_pps_to_avcc(&data)?;
+		self.description = Some(bytes::Bytes::from(avcc_data));
+
+		Ok(())
+	}
+
+	fn sps_pps_to_avcc(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+		// Parse SPS and PPS from the raw data
+		// The data contains NALUs with start codes (0x00000001)
+		let mut sps_data = None;
+		let mut pps_data = None;
+
+		let mut i = 0;
+		while i < data.len() {
+			// Look for NALU start code
+			if i + 3 < data.len() && data[i..i+4] == [0, 0, 0, 1] {
+				let nal_start = i + 4;
+
+				// Find the next start code or end of data
+				let nal_end = if let Some(next_start) = data[nal_start..].windows(4).position(|w| w == [0, 0, 0, 1]) {
+					nal_start + next_start
+				} else {
+					data.len()
+				};
+
+				if nal_end > nal_start {
+					let nal_type = data[nal_start] & 0x1F;
+					let nal_data = &data[nal_start..nal_end];
+
+					match nal_type {
+						7 => { // SPS
+							sps_data = Some(nal_data.to_vec());
+						}
+						8 => { // PPS
+							pps_data = Some(nal_data.to_vec());
+						}
+						_ => {}
+					}
+				}
+
+				i = nal_end;
+			} else {
+				i += 1;
+			}
+		}
+
+		let sps = sps_data.ok_or_else(|| anyhow::anyhow!("No SPS found in initialization data"))?;
+		let pps = pps_data.ok_or_else(|| anyhow::anyhow!("No PPS found in initialization data"))?;
+
+		// Parse SPS to extract profile/level info
+		if sps.len() < 4 {
+			return Err(anyhow::anyhow!("SPS too short"));
+		}
+
+		let profile_idc = sps[1];
+		let constraint_flags = sps[2];
+		let level_idc = sps[3];
+
+		// Build AVCC format
+		let mut avcc = Vec::new();
+
+		// AVCC header
+		avcc.push(1); // version
+		avcc.push(profile_idc); // profile
+		avcc.push(constraint_flags); // profile compatibility
+		avcc.push(level_idc); // level
+		avcc.push(0xFC | 3); // NALU length size minus 1 (3 = 4 bytes)
+
+		// SPS count
+		avcc.push(1); // number of SPS
+		// SPS size (big endian)
+		let sps_size = (sps.len() as u16).to_be_bytes();
+		avcc.extend_from_slice(&sps_size);
+		// SPS data
+		avcc.extend_from_slice(&sps);
+
+		// PPS count
+		avcc.push(1); // number of PPS
+		// PPS size (big endian)
+		let pps_size = (pps.len() as u16).to_be_bytes();
+		avcc.extend_from_slice(&pps_size);
+		// PPS data
+		avcc.extend_from_slice(&pps);
+
+		Ok(avcc)
 	}
 
 	fn init(&mut self, sps: &h264_parser::Sps) -> anyhow::Result<()> {

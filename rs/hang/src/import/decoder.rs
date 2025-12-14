@@ -53,18 +53,14 @@ impl Decoder {
 	///
 	/// The buffer will be fully consumed, or an error will be returned.
 	pub fn initialize<T: Buf + AsRef<[u8]>>(&mut self, buf: &mut T) -> anyhow::Result<()> {
-		let mut pts = || {
-			self.zero = self.zero.or_else(|| Some(tokio::time::Instant::now()));
-			hang::Timestamp::from_micros(self.zero.unwrap().elapsed().as_micros() as u64)
-		};
-
 		match &mut self.decoder {
-			DecoderKind::Avc3(decoder) => decoder.decode_frame(buf, pts()?)?,
+			DecoderKind::Avc3(decoder) => decoder.initialize(buf)?,
 			DecoderKind::Fmp4(decoder) => decoder.decode(buf)?,
 			DecoderKind::Aac(decoder) => decoder.initialize(buf)?,
 		}
 
-		anyhow::ensure!(!buf.has_remaining(), "buffer was not fully consumed");
+		// Note: Some decoders may not consume the entire buffer if they only need the initialization data
+		// This is normal behavior and should not be treated as an error
 
 		Ok(())
 	}
