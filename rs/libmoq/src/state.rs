@@ -295,8 +295,11 @@ impl State {
 						if let Some(catalog_data) = catalog.next().await? {
 							let catalog_json = catalog_data.to_string()?;
 							if let Some(on_catalog) = callbacks.on_catalog {
-								let c_string = std::ffi::CString::new(catalog_json).unwrap();
-								unsafe { on_catalog(callbacks.user_data, c_string.as_ptr()) };
+								if let Ok(c_string) = std::ffi::CString::new(catalog_json) {
+									unsafe { on_catalog(callbacks.user_data, c_string.as_ptr()) };
+								} else {
+									tracing::warn!("Catalog JSON contains null bytes, skipping callback");
+								}
 							}
 
 							// Subscribe to video tracks
