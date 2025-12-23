@@ -21,9 +21,6 @@ pub fn provider() -> Provider {
 		let _ = rustls::crypto::CryptoProvider::install_default(provider_inner.clone());
 		return Arc::new(provider_inner);
 	}
-
-	#[allow(unreachable_code)]
-	panic!("no CryptoProvider available; install_default() or enable either the aws-lc-rs or ring feature");
 }
 
 /// Helper function to compute SHA256 hash using the crypto provider
